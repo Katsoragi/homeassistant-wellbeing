@@ -40,16 +40,40 @@ VACUUM_ACTIVITIES = {
     10: VacuumActivity.IDLE,
     11: VacuumActivity.ERROR,
     12: VacuumActivity.DOCKED,  # Pitstop
-    13: VacuumActivity.IDLE,  # Manual stearing
+    13: VacuumActivity.IDLE,  # Manual steering
     14: VacuumActivity.IDLE,  # Firmware upgrading
-    "idle": VacuumActivity.IDLE,  # robot700series idle
-    "inProgress": VacuumActivity.CLEANING,  # robot700series cleaning
-    "goingHome": VacuumActivity.RETURNING,  # robot700series returning
-    "paused": VacuumActivity.PAUSED,  # robot700series paused
-    "sleeping": VacuumActivity.DOCKED,  # robot700series sleeping
-    "vacuuming": VacuumActivity.CLEANING,  # Cybele vacuuming
-    "mopping": VacuumActivity.CLEANING,  # Cybele mopping
-    "vaccumAndMopping": VacuumActivity.CLEANING,  # Cybele combined cleaning
+    "idle": VacuumActivity.IDLE,
+    "inProgress": VacuumActivity.CLEANING,
+    "goingHome": VacuumActivity.RETURNING,
+    "paused": VacuumActivity.PAUSED,
+    "sleeping": VacuumActivity.DOCKED,
+    "vacuuming": VacuumActivity.CLEANING,
+    "mopping": VacuumActivity.CLEANING,
+    "vaccumAndMopping": VacuumActivity.CLEANING,
+}
+
+ROBOT_STATUS_LABELS_DE = {
+    1: "Reinigt",
+    2: "Pausiert",
+    3: "Stoppt Reinigung",
+    4: "Spot-Reinigung pausiert",
+    5: "Fährt zur Ladestation",
+    6: "Rückfahrt pausiert",
+    7: "Pitstop (Fährt zum Zwischenladen)",
+    8: "Pitstop-Rückfahrt pausiert",
+    9: "In Ladestation (Geladen)",
+    10: "Bereit (Schlummermodus)",
+    11: "Fehler / Blockiert",
+    12: "Pitstop (Lädt zwischen)",
+    13: "Manuelle Steuerung",
+    14: "Firmware-Update läuft",
+}
+
+DUSTBIN_LABELS_DE = {
+    "connected": "Eingesetzt (OK)",
+    "notconnected": "OK (Leer)",
+    "full": "Voll – Bitte leeren!",
+    "empty": "Leer (OK)",
 }
 
 
@@ -72,7 +96,7 @@ async def async_setup_entry(hass, entry, async_add_devices):
 
 
 class WellbeingVacuum(WellbeingEntity, StateVacuumEntity):
-    """wellbeing Sensor class."""
+    """Wellbeing Vacuum class."""
 
     _attr_translation_key = "vacuum"
 
@@ -106,26 +130,72 @@ class WellbeingVacuum(WellbeingEntity, StateVacuumEntity):
         """Return the list of available fan speeds."""
         return self.get_appliance.vacuum_fan_speed_list
 
+    @property
+    def extra_state_attributes(self):
+        """Return extended state attributes including map and zone metadata."""
+        base = super().extra_state_attributes
+        app = self.get_appliance
+        raw_status = self.get_entity.state
+        dustbin_raw = str(app.reported_state.get("dustbinStatus", "unknown"))
+        selected_map = self.api.get_selected_map(self.pnc_id)
+        all_maps = self.api.get_interactive_maps(self.pnc_id)
+
+        active_zones = []
+        if selected_map:
+            active_zones = [
+                z["name"]
+                for z in selected_map.get("zones", [])
+                if z.get("type") == "clean"
+            ]
+
+        all_zones = []
+        for m in all_maps:
+            for z in m.get("zones", []):
+                if z.get("type") == "clean" and z["name"] not in all_zones:
+                    all_zones.append(z["name"])
+
+        return {
+            **base,
+            "status_code": raw_status,
+            "status_detail": ROBOT_STATUS_LABELS_DE.get(raw_status, str(raw_status)),
+            "dustbin_status": DUSTBIN_LABELS_DE.get(dustbin_raw.casefold(), dustbin_raw),
+            "active_map": selected_map.get("name") if selected_map else None,
+            "active_map_id": selected_map.get("id") if selected_map else None,
+            "available_maps": [m["name"] for m in all_maps],
+            "available_zones": active_zones,
+            "all_zones": all_zones,
+            "active_cleaning_zones": self.api.get_active_cleaning_zones(self.pnc_id),
+        }
+
     async def async_start(self):
         """Start the vacuum cleaner."""
         await self.api.vacuum_start(self.pnc_id)
+        self.coordinator.async_update_listeners()
+        await self.async_refresh_later(5)
 
     async def async_stop(self):
         """Stop the vacuum cleaner."""
         await self.api.vacuum_stop(self.pnc_id)
+        self.coordinator.async_update_listeners()
+        await self.async_refresh_later(5)
 
     async def async_pause(self):
         """Pause the vacuum cleaner."""
         await self.api.vacuum_pause(self.pnc_id)
+        self.coordinator.async_update_listeners()
+        await self.async_refresh_later(5)
 
     async def async_return_to_base(self):
         """Return the vacuum cleaner to its base."""
         await self.api.vacuum_return_to_base(self.pnc_id)
+        self.coordinator.async_update_listeners()
+        await self.async_refresh_later(5)
 
     async def async_set_fan_speed(self, fan_speed: str) -> None:
         """Set the fan speed of the vacuum cleaner."""
         await self.api.vacuum_set_fan_speed(self.pnc_id, self.get_appliance, fan_speed)
-        self.async_write_ha_state()  # Optimistically update the state before the next coordinator refresh
+        self.async_write_ha_state()
+        self.coordinator.async_update_listeners()
 
     async def async_get_segments(self) -> list[Segment]:
         """Get the segments that can be cleaned."""
@@ -134,9 +204,13 @@ class WellbeingVacuum(WellbeingEntity, StateVacuumEntity):
     async def async_clean_segments(self, segment_ids: list[str], **kwargs: Any) -> None:
         """Perform an area clean."""
         await self.api.vacuum_clean_segments(self.pnc_id, segment_ids)
+        self.coordinator.async_update_listeners()
+        await self.async_refresh_later(5)
 
     async def async_send_command(
         self, command: str, params: dict[str, Any] | None = None, **kwargs: Any
     ) -> None:
         """Send a custom command to the vacuum cleaner."""
         await self.api.vacuum_send_command(self.pnc_id, command, params)
+        self.coordinator.async_update_listeners()
+        await self.async_refresh_later(5)

@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 """Sample API Client."""
 
 import asyncio
@@ -72,17 +74,18 @@ FAN_SPEEDS_PUREI92 = {
     "power": 3,
 }
 
+ALL_PUREI9_SPEEDS = ["quiet", "smart", "power", "eco"]
+
 INTERACTIVE_MAP_ZONE_SCHEMA = vol.Schema(
     {
         vol.Required("zone"): str,
-        vol.Optional("fan_speed"): vol.In(list(FAN_SPEEDS_PUREI92.keys())),
+        vol.Optional("fan_speed"): vol.In(ALL_PUREI9_SPEEDS),
     }
 )
 
 
 def validate_vacuum_zone_entry(value):
     """Helper to validate a zone entry for INTERACTIVE_MAP_SCHEMA."""
-    """Converts a string to a dictionary with a single 'zone' key for briefer default params."""
     if isinstance(value, str):
         return {"zone": value}
     if isinstance(value, dict):
@@ -92,10 +95,57 @@ def validate_vacuum_zone_entry(value):
 
 INTERACTIVE_MAP_SCHEMA = vol.Schema(
     {
-        vol.Required("map"): str,
+        vol.Optional("map"): str,
         vol.Required("zones"): [validate_vacuum_zone_entry],
+        vol.Optional("fan_speed"): vol.In(ALL_PUREI9_SPEEDS),
     }
 )
+
+
+def _format_map_name(map_data: dict, idx: int) -> str:
+    raw = map_data.get("name")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    ts = str(map_data.get("timestamp") or "")[:10]
+    if ts:
+        return f"Karte {idx + 1} ({ts})"
+    return f"Karte {idx + 1}"
+
+
+def _serialize_interactive_maps(api_maps: list) -> list[dict]:
+    result = []
+    seen_names: set[str] = set()
+    for idx, m in enumerate(api_maps or []):
+        mdata = getattr(m, "data", {}) or {}
+        name = _format_map_name(mdata, idx)
+        if name in seen_names:
+            name = f"{name} #{idx + 1}"
+        seen_names.add(name)
+        zones_out = []
+        for z in mdata.get("zones") or []:
+            if not isinstance(z, dict):
+                continue
+            zones_out.append(
+                {
+                    "id": z.get("id"),
+                    "name": z.get("name") or "Zone",
+                    "type": z.get("zoneType", "clean"),
+                    "power_mode": z.get("powerMode", 2),
+                    "room_category": z.get("roomCategory"),
+                    "vertices": z.get("vertices") or [],
+                }
+            )
+        result.append(
+            {
+                "id": mdata.get("id"),
+                "name": name,
+                "raw_name": mdata.get("name"),
+                "rotation": mdata.get("rotation", 0.0),
+                "timestamp": mdata.get("timestamp", ""),
+                "zones": zones_out,
+            }
+        )
+    return result
 
 FAN_SPEEDS_700SERIES = {
     "quiet": "quiet",
@@ -1117,6 +1167,41 @@ class WellbeingApiClient:
         self._load_lock = asyncio.Lock()
         self._livestream_revision = 0
         self._livestream_updates: dict[str, dict[str, tuple[int, object]]] = {}
+        self._interactive_maps: dict[str, list[dict]] = {}
+        self._selected_maps: dict[str, str] = {}
+        self._active_cleaning_zones: dict[str, list[str]] = {}
+        self.map_revision: int = 0
+
+    def get_interactive_maps(self, pnc_id: str) -> list[dict]:
+        return self._interactive_maps.get(pnc_id, [])
+
+    def get_map_names(self, pnc_id: str) -> list[str]:
+        return [m["name"] for m in self.get_interactive_maps(pnc_id)]
+
+    def get_selected_map(self, pnc_id: str) -> dict | None:
+        maps = self.get_interactive_maps(pnc_id)
+        if not maps:
+            return None
+        sel_name = self._selected_maps.get(pnc_id)
+        if sel_name:
+            found = next((m for m in maps if m["name"] == sel_name or m["raw_name"] == sel_name or m["id"] == sel_name), None)
+            if found:
+                return found
+        with_zones = next((m for m in maps if m.get("zones")), None)
+        chosen = with_zones or maps[0]
+        self._selected_maps[pnc_id] = chosen["name"]
+        return chosen
+
+    def get_selected_map_name(self, pnc_id: str) -> str | None:
+        m = self.get_selected_map(pnc_id)
+        return m["name"] if m else None
+
+    def set_selected_map_name(self, pnc_id: str, map_name: str, ha_appliances=None) -> None:
+        self._selected_maps[pnc_id] = map_name
+        self.map_revision += 1
+
+    def get_active_cleaning_zones(self, pnc_id: str) -> list[str]:
+        return self._active_cleaning_zones.get(pnc_id, [])
 
     async def _ensure_loaded(self) -> None:
         if self._api_appliances:
@@ -1180,10 +1265,26 @@ class WellbeingApiClient:
         await self._ensure_loaded()
         for appliance in self._api_appliances.values():
             poll_revision = self._livestream_revision
-            await appliance.async_update()
-            # The poll supersedes earlier stream values. Preserve only events
-            # received while this appliance request was in flight.
+            try:
+                async with asyncio.timeout(15):
+                    await appliance.async_update()
+            except TimeoutError:
+                _LOGGER.warning("Timeout updating appliance %s, using cached state", appliance.id)
+                continue
             self._reapply_concurrent_livestream_updates(appliance, poll_revision)
+
+            if appliance.type == Model.PUREi9.value:
+                try:
+                    async with asyncio.timeout(15):
+                        raw_maps = await appliance.async_get_interactive_maps()
+                    self._interactive_maps[appliance.id] = _serialize_interactive_maps(raw_maps)
+                    self.get_selected_map(appliance.id)
+                except Exception as err:
+                    _LOGGER.debug("Could not refresh interactive maps for %s: %s", appliance.id, err)
+
+                r_status = (appliance.state or {}).get("robotStatus")
+                if r_status in (9, 10, 11):
+                    self._active_cleaning_zones[appliance.id] = []
 
         found_appliances = {}
         for appliance in (appliance for appliance in self._api_appliances.values()):
@@ -1362,17 +1463,22 @@ class WellbeingApiClient:
             return [Segment(id=room.id, name=room.name) for room in api_map.rooms]
 
         if appliance.type == Model.PUREi9.value:
-            api_maps = await appliance.async_get_interactive_maps()
-            api_map = api_maps[0] if api_maps else None  # Default to the first map
-            if not api_map:
-                _LOGGER.error(
-                    f"No interactive maps found for appliance with id {pnc_id}"
-                )
+            maps = self.get_interactive_maps(pnc_id)
+            if not maps:
+                raw_maps = await appliance.async_get_interactive_maps()
+                maps = _serialize_interactive_maps(raw_maps)
+                self._interactive_maps[pnc_id] = maps
+            sel_map = self.get_selected_map(pnc_id)
+            target_maps = ([sel_map] if sel_map and sel_map.get("zones") else []) + [
+                m for m in maps if m.get("zones") and m != sel_map
+            ]
+            if not target_maps:
                 return []
+            chosen = target_maps[0]
             return [
-                Segment(id=zone.id, name=zone.name)
-                for zone in api_map.zones
-                if zone.type == "clean"
+                Segment(id=zone["id"], name=zone["name"])
+                for zone in chosen.get("zones", [])
+                if zone.get("type") == "clean"
             ]
 
         return []
@@ -1424,14 +1530,24 @@ class WellbeingApiClient:
             return
 
         if appliance.type == Model.PUREi9.value:
-            api_maps = await appliance.async_get_interactive_maps()
-            api_map = api_maps[0] if api_maps else None  # Default to the first map
-            if not api_map:
-                _LOGGER.error(
-                    f"No interactive maps found for appliance with id {pnc_id}"
-                )
+            maps = self.get_interactive_maps(pnc_id)
+            if not maps:
+                raw_maps = await appliance.async_get_interactive_maps()
+                maps = _serialize_interactive_maps(raw_maps)
+                self._interactive_maps[pnc_id] = maps
+            sel_map = self.get_selected_map(pnc_id)
+            candidate_maps = ([sel_map] if sel_map else []) + [m for m in maps if m != sel_map]
+            chosen_map = None
+            for m in candidate_maps:
+                m_zone_ids = {z["id"] for z in m.get("zones", [])}
+                if any(sid in m_zone_ids for sid in segment_ids):
+                    chosen_map = m
+                    break
+            if not chosen_map:
+                _LOGGER.error(f"No interactive map matching segments {segment_ids} for {pnc_id}")
                 return
-            zone_power_mode = {zone.id: zone.power_mode for zone in api_map.zones}
+            zone_power_mode = {z["id"]: z.get("power_mode", 2) for z in chosen_map.get("zones", [])}
+            zone_names_map = {z["id"]: z.get("name", "") for z in chosen_map.get("zones", [])}
             default_power_mode = FAN_SPEEDS_PUREI92.get("smart", 2)
             zones_payload = [
                 {
@@ -1439,9 +1555,14 @@ class WellbeingApiClient:
                     "powerMode": zone_power_mode.get(segment_id, default_power_mode),
                 }
                 for segment_id in segment_ids
+                if segment_id in zone_power_mode
             ]
+            self._active_cleaning_zones[pnc_id] = [
+                zone_names_map[sid] for sid in segment_ids if sid in zone_names_map
+            ]
+            self.map_revision += 1
             command_payload = {
-                "CustomPlay": {"persistentMapId": api_map.id, "zones": zones_payload}
+                "CustomPlay": {"persistentMapId": chosen_map["id"], "zones": zones_payload}
             }
             result = await appliance.send_command(command_payload)
             _LOGGER.debug(
@@ -1536,43 +1657,117 @@ class WellbeingApiClient:
             )
             return
 
+        if command == "clean_map" and appliance.type == Model.PUREi9.value:
+            params = params or {}
+            maps = self.get_interactive_maps(pnc_id)
+            if not maps:
+                raw_maps = await appliance.async_get_interactive_maps()
+                maps = _serialize_interactive_maps(raw_maps)
+                self._interactive_maps[pnc_id] = maps
+            req_map = params.get("map")
+            if req_map:
+                chosen_map = next(
+                    (m for m in maps if m["name"] == req_map or m["raw_name"] == req_map or m["id"] == req_map),
+                    None,
+                )
+            else:
+                chosen_map = self.get_selected_map(pnc_id)
+            if not chosen_map:
+                await self.vacuum_start(pnc_id)
+                return
+            self._selected_maps[pnc_id] = chosen_map["name"]
+            clean_zones = [z for z in chosen_map.get("zones", []) if z.get("type") == "clean"]
+            override_speed = params.get("fan_speed")
+            if clean_zones:
+                speed_map = {"quiet": 1, "eco": 1, "smart": 2, "power": 3}
+                zones_payload = [
+                    {
+                        "zoneId": z["id"],
+                        "powerMode": speed_map.get(override_speed, z.get("power_mode", 2)),
+                    }
+                    for z in clean_zones
+                ]
+                self._active_cleaning_zones[pnc_id] = [z["name"] for z in clean_zones]
+                self.map_revision += 1
+                command_payload = {
+                    "CustomPlay": {"persistentMapId": chosen_map["id"], "zones": zones_payload}
+                }
+                await appliance.send_command(command_payload)
+            else:
+                self._active_cleaning_zones[pnc_id] = []
+                self.map_revision += 1
+                await self.vacuum_start(pnc_id)
+            return
+
         if command == "clean_zones" and appliance.type == Model.PUREi9.value:
-            # Validate and process the parameters for the PUREi9 interactive map command.
             try:
                 params = INTERACTIVE_MAP_SCHEMA(params)
             except vol.Invalid as e:
                 raise ServiceValidationError(
                     f"Invalid parameters for command '{command}': {e}"
                 ) from e
-            assert isinstance(params, dict)  # Needed for mypy type checking
-            # Build the command payload for the PUREi9 interactive map.
-            api_maps = await appliance.async_get_interactive_maps()
-            api_map = next((m for m in api_maps if m.name == params["map"]), None)
-            if not api_map:
-                raise ServiceValidationError(
-                    f"Map '{params['map']}' not found for appliance with id {pnc_id}"
+            assert isinstance(params, dict)
+            maps = self.get_interactive_maps(pnc_id)
+            if not maps:
+                raw_maps = await appliance.async_get_interactive_maps()
+                maps = _serialize_interactive_maps(raw_maps)
+                self._interactive_maps[pnc_id] = maps
+
+            req_map = params.get("map")
+            chosen_map = None
+            if req_map and req_map != "active":
+                chosen_map = next(
+                    (m for m in maps if m["name"] == req_map or m["raw_name"] == req_map or m["id"] == req_map),
+                    None,
                 )
+            if not chosen_map:
+                sel = self.get_selected_map(pnc_id)
+                if sel and sel.get("zones"):
+                    chosen_map = sel
+                else:
+                    chosen_map = next((m for m in maps if m.get("zones")), sel)
+
+            if not chosen_map:
+                raise ServiceValidationError(
+                    f"No map found for appliance with id {pnc_id}"
+                )
+
+            speed_map = {"quiet": 1, "eco": 1, "smart": 2, "power": 3}
+            global_speed = params.get("fan_speed")
             zones_payload = []
+            cleaned_names = []
             for zone in params["zones"]:
+                target_name = zone["zone"].strip().casefold()
                 api_zone = next(
-                    (z for z in api_map.zones if z.name == zone["zone"]), None
+                    (z for z in chosen_map.get("zones", []) if str(z.get("name", "")).strip().casefold() == target_name),
+                    None,
                 )
                 if not api_zone:
+                    # Fallback: search across all maps on this appliance
+                    for m in maps:
+                        found_z = next(
+                            (z for z in m.get("zones", []) if str(z.get("name", "")).strip().casefold() == target_name),
+                            None,
+                        )
+                        if found_z:
+                            chosen_map = m
+                            api_zone = found_z
+                            break
+                if not api_zone:
                     raise ServiceValidationError(
-                        f"Zone '{zone['zone']}' not found in map '{params['map']}'"
+                        f"Zone '{zone['zone']}' not found in map '{chosen_map['name']}'"
                     )
-                zones_payload.append(
-                    {
-                        "zoneId": api_zone.id,
-                        "powerMode": FAN_SPEEDS_PUREI92.get(
-                            zone.get("fan_speed"), api_zone.power_mode
-                        ),
-                    }
-                )
+                z_speed = zone.get("fan_speed") or global_speed
+                pm = speed_map.get(z_speed, api_zone.get("power_mode", 2))
+                zones_payload.append({"zoneId": api_zone["id"], "powerMode": pm})
+                cleaned_names.append(api_zone["name"])
+
+            self._selected_maps[pnc_id] = chosen_map["name"]
+            self._active_cleaning_zones[pnc_id] = cleaned_names
+            self.map_revision += 1
             command_payload = {
-                "CustomPlay": {"persistentMapId": api_map.id, "zones": zones_payload}
+                "CustomPlay": {"persistentMapId": chosen_map["id"], "zones": zones_payload}
             }
-            # Send the command to the appliance.
             result = await appliance.send_command(command_payload)
             _LOGGER.debug(
                 f"Sent command '{command}' with data: {command_payload}, result: {result}"

@@ -42,11 +42,17 @@ PLATFORMS = [
     Platform.CLIMATE,
     Platform.HUMIDIFIER,
     Platform.SELECT,
+    Platform.CAMERA,
 ]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up this integration using UI."""
+    import importlib, sys
+    for mod_name in ("custom_components.wellbeing.api", "custom_components.wellbeing.vacuum", "custom_components.wellbeing.select", "custom_components.wellbeing.camera"):
+        if mod_name in sys.modules:
+            importlib.reload(sys.modules[mod_name])
+    from .api import WellbeingApiClient
     if hass.data.get(DOMAIN) is None:
         hass.data.setdefault(DOMAIN, {})
 

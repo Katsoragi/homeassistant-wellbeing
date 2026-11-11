@@ -1,14 +1,22 @@
 {
-  "domain": "wellbeing",
-  "name": "Electrolux Wellbeing",
-  "after_dependencies": ["http"],
-  "codeowners": ["@JohNan"],
+  "after_dependencies": [
+    "http"
+  ],
+  "codeowners": [
+    "@JohNan"
+  ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/JohNan/homeassistant-wellbeing",
+  "documentation": "https://github.com/Katsoragi/homeassistant-wellbeing",
+  "domain": "wellbeing",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/JohNan/homeassistant-wellbeing/issues",
-  "loggers": ["pyelectroluxgroup"],
-  "requirements": ["pyelectroluxgroup==0.2.7"],
-  "version": "v0.0.0"
+  "loggers": [
+    "pyelectroluxgroup"
+  ],
+  "name": "Electrolux Wellbeing",
+  "requirements": [
+    "pyelectroluxgroup==0.2.7"
+  ],
+  "version": "v1.5.0-3dvision"
 }

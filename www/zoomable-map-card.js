@@ -254,8 +254,8 @@ class ZoomableMapCard extends HTMLElement {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          flex-wrap: wrap;
-          gap: 8px;
+          flex-wrap: nowrap;
+          gap: 10px;
           padding: 12px 16px;
           background: #141d2f;
           border-bottom: 1px solid #334155;
@@ -266,22 +266,31 @@ class ZoomableMapCard extends HTMLElement {
           display: flex;
           flex-direction: column;
           gap: 2px;
+          min-width: 0;
+          flex: 1;
         }
         .robot-title {
           font-size: 16px;
           font-weight: 700;
           color: #f8fafc;
           letter-spacing: 0.2px;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         .map-subtitle {
-          font-size: 12.5px;
+          font-size: 12px;
           color: #94a3b8;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         .header-right {
           display: flex;
           flex-direction: column;
           align-items: flex-end;
           gap: 4px;
+          flex-shrink: 0;
         }
         .status-pill {
           font-size: 12px;
@@ -720,10 +729,10 @@ class ZoomableMapCard extends HTMLElement {
     if (robotTitle) robotTitle.textContent = `${t.name || 'Roboter'}  •  ${t.model || 'AEG'}`;
     if (mapSubtitle) {
       const scanText = t.crumb_cnt > 0
-        ? `3D-Vision Scan (${t.crumb_cnt} Messpunkte)`
+        ? `${t.crumb_cnt} Messpunkte`
         : `${(t.all_maps || []).length} Karten in Cloud`;
-      const sqmText = t.total_sqm > 0 ? `  •  Zonenfläche: ${t.total_sqm.toFixed(1)} m²` : '';
-      mapSubtitle.textContent = `Aktive Karte: ${t.active_map || 'Keine'}  •  ${scanText}${sqmText}`;
+      const sqmText = t.total_sqm > 0 ? ` • ${t.total_sqm.toFixed(1)} m²` : '';
+      mapSubtitle.textContent = `Karte: ${t.active_map || 'Keine'} • ${scanText}${sqmText}`;
     }
     if (statusPill) {
       statusPill.textContent = `${t.status_text}  |  Akku: ${t.bat_pct}%  |  Modus: ${t.fan_speed}`;

@@ -1,25 +1,44 @@
 /**
- * Zoomable 3D-Vision Vector Map Card for Home Assistant Lovelace (v2.0.0)
+ * Zoomable 3D-Vision Vector Map Card for Home Assistant Lovelace (v2.1.0)
  * - Fixed Header, Footer & Legend (never scroll or zoom off-screen)
  * - True SVG Vector Map rendering (razor-sharp at any zoom level, 0% pixelation)
+ * - Click-to-Select / Click-to-Clean directly on SVG room polygons (synced with input_boolean helpers)
+ * - Avoid Zones (No-Go) hatching & Live Robot Marker during cleaning
  * - Smooth Mousewheel Zoom, Drag-to-Pan, Touch Pinch-to-Zoom, Double-click & Fullscreen
  * - Live Dynamic Scale Bar (meters -> screen pixels)
  */
 
 const ZONE_PALETTE = [
-  { fill: 'rgba(56, 189, 248, 0.28)', stroke: 'rgba(56, 189, 248, 0.92)', text: '#38bdf8' },   // Sky Cyan
-  { fill: 'rgba(168, 85, 247, 0.28)', stroke: 'rgba(192, 132, 252, 0.92)', text: '#c084fc' },  // Purple
-  { fill: 'rgba(245, 158, 11, 0.28)', stroke: 'rgba(251, 191, 36, 0.92)', text: '#fbbf24' },   // Amber
-  { fill: 'rgba(16, 185, 129, 0.28)', stroke: 'rgba(52, 211, 153, 0.92)', text: '#34d399' },   // Emerald
-  { fill: 'rgba(236, 72, 153, 0.28)', stroke: 'rgba(244, 114, 182, 0.92)', text: '#f472b6' },  // Pink
-  { fill: 'rgba(99, 102, 241, 0.28)', stroke: 'rgba(129, 140, 248, 0.92)', text: '#818cf8' },  // Indigo
+  { fill: 'rgba(56, 189, 248, 0.25)', stroke: 'rgba(56, 189, 248, 0.90)', text: '#38bdf8' },   // Sky Cyan
+  { fill: 'rgba(168, 85, 247, 0.25)', stroke: 'rgba(192, 132, 252, 0.90)', text: '#c084fc' },  // Purple
+  { fill: 'rgba(245, 158, 11, 0.25)', stroke: 'rgba(251, 191, 36, 0.90)', text: '#fbbf24' },   // Amber
+  { fill: 'rgba(16, 185, 129, 0.25)', stroke: 'rgba(52, 211, 153, 0.90)', text: '#34d399' },   // Emerald
+  { fill: 'rgba(236, 72, 153, 0.25)', stroke: 'rgba(244, 114, 182, 0.90)', text: '#f472b6' },  // Pink
+  { fill: 'rgba(99, 102, 241, 0.25)', stroke: 'rgba(129, 140, 248, 0.90)', text: '#818cf8' },  // Indigo
 ];
 
+const SELECTED_ZONE_STYLE = {
+  fill: 'rgba(56, 189, 248, 0.52)',
+  stroke: '#f8fafc',
+  text: '#ffffff',
+};
+
 const ACTIVE_ZONE_STYLE = {
-  fill: 'rgba(34, 197, 94, 0.45)',
+  fill: 'rgba(34, 197, 94, 0.48)',
   stroke: '#4ade80',
   text: '#4ade80',
 };
+
+function slugifyZone(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/ä/g, 'a')
+    .replace(/ö/g, 'o')
+    .replace(/ü/g, 'u')
+    .replace(/ß/g, 'ss')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
 
 class ZoomableMapCard extends HTMLElement {
   constructor() {
@@ -28,12 +47,15 @@ class ZoomableMapCard extends HTMLElement {
     this._config = {};
     this._hass = null;
 
-    // Map data state
+    // Map data & selection state
     this._mapData = null;
     this._lastFetchKey = '';
     this._fetching = false;
+    this._localSelectedZones = new Set();
+    this._selectedSpeed = '';
+    this._lastBoolSig = '';
 
-    // Pan & Zoom state (in screen pixels relative to fitted center)
+    // Pan & Zoom state
     this._scale = 1.0;
     this._panX = 0;
     this._panY = 0;
@@ -43,6 +65,8 @@ class ZoomableMapCard extends HTMLElement {
     this._isDragging = false;
     this._dragStartX = 0;
     this._dragStartY = 0;
+    this._pointerDownX = 0;
+    this._pointerDownY = 0;
     this._initialDistance = 0;
     this._initialScale = 1.0;
     this._touchMidX = 0;
@@ -63,6 +87,8 @@ class ZoomableMapCard extends HTMLElement {
     this._toggleFullscreen = this._toggleFullscreen.bind(this);
     this._onFullscreenChange = this._onFullscreenChange.bind(this);
     this._onResize = this._onResize.bind(this);
+    this._startSelectedClean = this._startSelectedClean.bind(this);
+    this._clearSelection = this._clearSelection.bind(this);
   }
 
   setConfig(config) {
@@ -82,6 +108,7 @@ class ZoomableMapCard extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     this._checkAndFetchMapData();
+    this._syncExternalBooleanStates();
   }
 
   getCardSize() {
@@ -93,6 +120,97 @@ class ZoomableMapCard extends HTMLElement {
       type: 'custom:zoomable-map-card',
       entity: 'camera.wellbeing_fenrir_mapdata',
     };
+  }
+
+  _getVacuumEntityId() {
+    if (this._config.vacuum_entity) return this._config.vacuum_entity;
+    return this._config.entity
+      .replace(/^camera\./, 'vacuum.')
+      .replace(/_mapdata$/, '_robotstatus');
+  }
+
+  _getHelperEntityForZone(zoneName) {
+    if (!this._hass || !this._mapData) return null;
+    const robotSlug = slugifyZone((this._mapData.telemetry && this._mapData.telemetry.name) || '');
+    const zSlug = slugifyZone(zoneName);
+    const candidate = `input_boolean.${robotSlug}_zone_${zSlug}`;
+    if (this._hass.states[candidate]) return candidate;
+    return null;
+  }
+
+  _isZoneSelected(zoneName) {
+    const helper = this._getHelperEntityForZone(zoneName);
+    if (helper && this._hass && this._hass.states[helper]) {
+      return this._hass.states[helper].state === 'on';
+    }
+    return this._localSelectedZones.has(zoneName);
+  }
+
+  _getSelectedZonesList() {
+    if (!this._mapData || !this._mapData.zones) return [];
+    return this._mapData.zones
+      .filter(z => this._isZoneSelected(z.name))
+      .map(z => z.name);
+  }
+
+  _syncExternalBooleanStates() {
+    if (!this._hass || !this._mapData || !this._mapData.zones) return;
+    const sig = this._mapData.zones
+      .map(z => `${z.name}:${this._isZoneSelected(z.name) ? 1 : 0}`)
+      .join('|');
+    if (sig !== this._lastBoolSig) {
+      this._lastBoolSig = sig;
+      this._buildSvgWorld();
+      this._applySvgTransform();
+      this._updateSelectionBar();
+    }
+  }
+
+  async _toggleZoneSelection(zoneName) {
+    const helper = this._getHelperEntityForZone(zoneName);
+    if (helper && this._hass) {
+      await this._hass.callService('input_boolean', 'toggle', { entity_id: helper });
+    } else {
+      if (this._localSelectedZones.has(zoneName)) {
+        this._localSelectedZones.delete(zoneName);
+      } else {
+        this._localSelectedZones.add(zoneName);
+      }
+      this._syncExternalBooleanStates();
+    }
+  }
+
+  async _clearSelection() {
+    if (!this._mapData || !this._mapData.zones) return;
+    for (const z of this._mapData.zones) {
+      const helper = this._getHelperEntityForZone(z.name);
+      if (helper && this._hass && this._hass.states[helper]?.state === 'on') {
+        await this._hass.callService('input_boolean', 'turn_off', { entity_id: helper });
+      }
+    }
+    this._localSelectedZones.clear();
+    this._syncExternalBooleanStates();
+  }
+
+  async _startSelectedClean() {
+    const selected = this._getSelectedZonesList();
+    if (!selected.length || !this._hass) return;
+
+    const vacuumEntity = this._getVacuumEntityId();
+    const activeMap = this._mapData?.telemetry?.active_map || 'active';
+    const params = {
+      map: activeMap,
+      zones: selected,
+    };
+    if (this._selectedSpeed) {
+      params.fan_speed = this._selectedSpeed;
+    }
+
+    await this._hass.callService('vacuum', 'send_command', {
+      entity_id: vacuumEntity,
+      command: 'clean_zones',
+      params,
+    });
   }
 
   _renderSkeleton() {
@@ -225,6 +343,22 @@ class ZoomableMapCard extends HTMLElement {
           display: block;
           overflow: visible;
         }
+        .zone-poly {
+          cursor: pointer;
+          transition: fill 0.15s ease, stroke-width 0.15s ease;
+        }
+        .zone-poly:hover {
+          filter: brightness(1.22);
+        }
+
+        @keyframes pulseRing {
+          0% { transform: scale(0.8); opacity: 0.9; }
+          100% { transform: scale(2.2); opacity: 0; }
+        }
+        .robot-pulse {
+          transform-origin: center;
+          animation: pulseRing 1.8s ease-out infinite;
+        }
 
         /* FLOATING CONTROLS */
         .controls-overlay {
@@ -270,7 +404,82 @@ class ZoomableMapCard extends HTMLElement {
           fill: currentColor;
         }
 
-        /* DYNAMIC SCALE BAR & ZOOM BADGE (FIXED ON CANVAS) */
+        /* FLOATING SELECTION ACTION BAR */
+        .selection-bar {
+          position: absolute;
+          bottom: 12px;
+          left: 50%;
+          transform: translateX(-50%);
+          display: none;
+          align-items: center;
+          gap: 8px;
+          background: rgba(15, 23, 42, 0.94);
+          backdrop-filter: blur(10px);
+          -webkit-backdrop-filter: blur(10px);
+          border: 1px solid rgba(56, 189, 248, 0.55);
+          padding: 6px 10px;
+          border-radius: 12px;
+          box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+          z-index: 25;
+          white-space: nowrap;
+        }
+        .selection-bar.visible {
+          display: flex;
+        }
+        .sel-count {
+          font-size: 12px;
+          font-weight: 600;
+          color: #e2e8f0;
+          padding: 0 4px;
+        }
+        .sel-speed {
+          background: #1e293b;
+          color: #cbd5e1;
+          border: 1px solid #475569;
+          border-radius: 7px;
+          padding: 4px 7px;
+          font-size: 11.5px;
+          font-weight: 600;
+          cursor: pointer;
+          outline: none;
+        }
+        .sel-go {
+          background: #16a34a;
+          color: #ffffff;
+          border: none;
+          border-radius: 8px;
+          padding: 6px 12px;
+          font-size: 12px;
+          font-weight: 700;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          transition: background 0.15s ease;
+        }
+        .sel-go:hover {
+          background: #15803d;
+        }
+        .sel-clear {
+          background: rgba(51, 65, 85, 0.7);
+          color: #cbd5e1;
+          border: none;
+          border-radius: 8px;
+          width: 26px;
+          height: 26px;
+          font-size: 13px;
+          font-weight: 700;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .sel-clear:hover {
+          background: rgba(239, 68, 68, 0.75);
+          color: #ffffff;
+        }
+
+        /* DYNAMIC SCALE BAR & ZOOM BADGE */
         .scale-overlay {
           position: absolute;
           bottom: 12px;
@@ -355,7 +564,6 @@ class ZoomableMapCard extends HTMLElement {
       </style>
 
       <ha-card id="cardRoot">
-        <!-- FIXED HEADER -->
         <div class="header" id="header">
           <div class="header-left">
             <div class="robot-title" id="robotTitle">Lade Karte...</div>
@@ -367,9 +575,13 @@ class ZoomableMapCard extends HTMLElement {
           </div>
         </div>
 
-        <!-- VECTOR VIEWPORT -->
         <div class="viewport" id="viewport">
           <svg class="map-svg" id="mapSvg" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <pattern id="hatchRed" width="0.18" height="0.18" patternTransform="rotate(45 0 0)" patternUnits="userSpaceOnUse">
+                <line x1="0" y1="0" x2="0" y2="0.18" stroke="rgba(239, 68, 68, 0.55)" stroke-width="0.04" />
+              </pattern>
+            </defs>
             <g id="worldGroup"></g>
           </svg>
 
@@ -386,6 +598,18 @@ class ZoomableMapCard extends HTMLElement {
             </button>
           </div>
 
+          <div class="selection-bar" id="selectionBar">
+            <span class="sel-count" id="selCount">0 gewählt</span>
+            <select class="sel-speed" id="selSpeed" title="Saugstärke für diese Auswahl">
+              <option value="">Auto</option>
+              <option value="quiet">Quiet</option>
+              <option value="smart">Smart</option>
+              <option value="power">Power</option>
+            </select>
+            <button class="sel-go" id="btnSelGo">▶ Saugen</button>
+            <button class="sel-clear" id="btnSelClear" title="Auswahl aufheben">✕</button>
+          </div>
+
           <div class="scale-overlay" id="scaleOverlay">
             <div class="scale-bar-wrap">
               <div class="scale-line" id="scaleLine" style="width: 60px;"></div>
@@ -396,7 +620,6 @@ class ZoomableMapCard extends HTMLElement {
           <div class="zoom-badge" id="zoomBadge">100%</div>
         </div>
 
-        <!-- FIXED FOOTER / LEGEND -->
         <div class="footer" id="footer">
           <div class="footer-left" id="footerLeft">Verfügbare Karten: —</div>
           <div class="footer-right" id="footerRight">—</div>
@@ -421,6 +644,12 @@ class ZoomableMapCard extends HTMLElement {
     this.shadowRoot.getElementById('btnZoomOut').addEventListener('click', this._zoomOut);
     this.shadowRoot.getElementById('btnReset').addEventListener('click', this._resetZoom);
     this.shadowRoot.getElementById('btnFullscreen').addEventListener('click', this._toggleFullscreen);
+
+    this.shadowRoot.getElementById('btnSelGo').addEventListener('click', this._startSelectedClean);
+    this.shadowRoot.getElementById('btnSelClear').addEventListener('click', this._clearSelection);
+    this.shadowRoot.getElementById('selSpeed').addEventListener('change', (e) => {
+      this._selectedSpeed = e.target.value;
+    });
 
     document.addEventListener('fullscreenchange', this._onFullscreenChange);
     document.addEventListener('webkitfullscreenchange', this._onFullscreenChange);
@@ -460,6 +689,20 @@ class ZoomableMapCard extends HTMLElement {
     }
   }
 
+  _updateSelectionBar() {
+    const bar = this.shadowRoot ? this.shadowRoot.getElementById('selectionBar') : null;
+    const countEl = this.shadowRoot ? this.shadowRoot.getElementById('selCount') : null;
+    if (!bar || !countEl) return;
+
+    const selected = this._getSelectedZonesList();
+    if (selected.length > 0) {
+      bar.classList.add('visible');
+      countEl.textContent = selected.length === 1 ? '1 Raum gewählt' : `${selected.length} Räume gewählt`;
+    } else {
+      bar.classList.remove('visible');
+    }
+  }
+
   _renderMapData() {
     const data = this._mapData;
     if (!data || !this.shadowRoot) return;
@@ -469,7 +712,6 @@ class ZoomableMapCard extends HTMLElement {
 
     const t = data.telemetry || {};
 
-    // 1. Update Fixed Header
     const robotTitle = this.shadowRoot.getElementById('robotTitle');
     const mapSubtitle = this.shadowRoot.getElementById('mapSubtitle');
     const statusPill = this.shadowRoot.getElementById('statusPill');
@@ -492,7 +734,6 @@ class ZoomableMapCard extends HTMLElement {
       dustbinLabel.className = 'dustbin-label' + (t.dustbin_ok ? '' : ' error');
     }
 
-    // 2. Update Fixed Footer
     const footerLeft = this.shadowRoot.getElementById('footerLeft');
     const footerRight = this.shadowRoot.getElementById('footerRight');
     if (footerLeft) {
@@ -502,13 +743,13 @@ class ZoomableMapCard extends HTMLElement {
     if (footerRight) {
       const zNames = (data.zones || []).map(z => z.name);
       footerRight.textContent = zNames.length > 0
-        ? `Räume (${zNames.length}): ${zNames.join(', ')}`
+        ? `Räume (${zNames.length}): ${zNames.join(', ')} (anklickbar)`
         : 'Modus: Komplette vermessene Etage';
     }
 
-    // 3. Render SVG Vector World
     this._buildSvgWorld();
     this._applySvgTransform();
+    this._updateSelectionBar();
   }
 
   _buildSvgWorld() {
@@ -525,7 +766,7 @@ class ZoomableMapCard extends HTMLElement {
     const wallW = robotW + 0.12;
     let svgHtml = '';
 
-    // Layer 1A: Outer Wall / Obstacle Perimeter
+    // Layer 1: Measured 3D-Vision Scan
     if (data.runs && data.runs.length > 0) {
       const dPaths = data.runs.map(run => {
         if (run.length === 1) {
@@ -535,28 +776,38 @@ class ZoomableMapCard extends HTMLElement {
       }).join(' ');
 
       svgHtml += `<path d="${dPaths}" fill="none" stroke="rgba(148, 163, 184, 0.94)" stroke-width="${wallW}" stroke-linecap="round" stroke-linejoin="round" />`;
-      // Layer 1B: Scanned Room Floor Interior Swath
       svgHtml += `<path d="${dPaths}" fill="none" stroke="#2b4c7e" stroke-width="${robotW}" stroke-linecap="round" stroke-linejoin="round" />`;
-      // Layer 1C: Driven Cleaning Trajectory Path
       svgHtml += `<path d="${dPaths}" fill="none" stroke="rgba(125, 211, 252, 0.58)" stroke-width="0.035" stroke-linecap="round" stroke-linejoin="round" />`;
     }
 
-    // Layer 2: Interactive Zone Polygons
+    // Layer 2: Avoid Zones (Sperrzonen)
+    (data.avoid_zones || []).forEach(az => {
+      const ptsStr = az.vertices.map(v => `${v[0]},${v[1]}`).join(' ');
+      svgHtml += `<polygon points="${ptsStr}" fill="url(#hatchRed)" stroke="rgba(239, 68, 68, 0.9)" stroke-width="1.8" stroke-dasharray="6 4" vector-effect="non-scaling-stroke" />`;
+    });
+
+    // Layer 3: Interactive Zone Polygons (Click-to-Select!)
     (data.zones || []).forEach(z => {
-      const style = z.active ? ACTIVE_ZONE_STYLE : ZONE_PALETTE[z.color_idx % ZONE_PALETTE.length];
+      const isSelected = this._isZoneSelected(z.name);
+      const style = z.active
+        ? ACTIVE_ZONE_STYLE
+        : isSelected
+          ? SELECTED_ZONE_STYLE
+          : ZONE_PALETTE[z.color_idx % ZONE_PALETTE.length];
       const ptsStr = z.vertices.map(v => `${v[0]},${v[1]}`).join(' ');
-      svgHtml += `<polygon points="${ptsStr}" fill="${style.fill}" stroke="${style.stroke}" stroke-width="${z.active ? 2.5 : 1.8}" vector-effect="non-scaling-stroke" stroke-linejoin="round" />`;
-      // Corner dots
+      const strokeW = z.active || isSelected ? 2.6 : 1.8;
+
+      svgHtml += `<polygon class="zone-poly" data-zone-name="${this._escapeXml(z.name)}" points="${ptsStr}" fill="${style.fill}" stroke="${style.stroke}" stroke-width="${strokeW}" vector-effect="non-scaling-stroke" stroke-linejoin="round" />`;
       z.vertices.forEach(v => {
-        svgHtml += `<circle cx="${v[0]}" cy="${v[1]}" r="0.065" fill="${style.stroke}" />`;
+        svgHtml += `<circle cx="${v[0]}" cy="${v[1]}" r="0.065" fill="${style.stroke}" style="pointer-events:none;" />`;
       });
     });
 
-    // Layer 3: Charger Dock
+    // Layer 4: Charger Dock
     if (data.charger) {
       const [cx, cy] = data.charger;
       svgHtml += `
-        <g class="charger-group" transform="translate(${cx}, ${cy})">
+        <g class="charger-group" transform="translate(${cx}, ${cy})" style="pointer-events:none;">
           <circle cx="0" cy="0" r="0.22" fill="#064e3b" stroke="#34d399" stroke-width="2" vector-effect="non-scaling-stroke" />
           <path d="M -0.02 -0.11 L -0.08 0.02 L -0.01 0.02 L -0.03 0.11 L 0.08 -0.02 L 0.01 -0.02 Z" fill="#34d399" />
           <g class="inv-scale" transform="translate(0, 0.34)">
@@ -567,18 +818,39 @@ class ZoomableMapCard extends HTMLElement {
       `;
     }
 
-    // Layer 4: Room Labels (in inverse-scaled groups so text stays crisp & readable!)
+    // Layer 5: Live Robot Marker (when cleaning)
+    if (data.telemetry?.is_cleaning && data.last_pos) {
+      const [rx, ry] = data.last_pos;
+      svgHtml += `
+        <g transform="translate(${rx}, ${ry})" style="pointer-events:none;">
+          <circle class="robot-pulse" cx="0" cy="0" r="0.24" fill="none" stroke="#4ade80" stroke-width="2" vector-effect="non-scaling-stroke" />
+          <circle cx="0" cy="0" r="0.18" fill="#0f172a" stroke="#4ade80" stroke-width="2.5" vector-effect="non-scaling-stroke" />
+          <circle cx="0" cy="0" r="0.06" fill="#4ade80" />
+        </g>
+      `;
+    }
+
+    // Layer 6: Room Labels
     (data.zones || []).forEach(z => {
       const [cx, cy] = z.center;
-      const style = z.active ? ACTIVE_ZONE_STYLE : ZONE_PALETTE[z.color_idx % ZONE_PALETTE.length];
-      const subText = z.active ? 'REINIGT JETZT' : `${z.area_sqm.toFixed(1)} m²${z.power_mode ? ' • ' + z.power_mode : ''}`;
-      const approxW = Math.max(z.name.length * 7.8 + 20, subText.length * 6.2 + 18, 90);
+      const isSelected = this._isZoneSelected(z.name);
+      const style = z.active
+        ? ACTIVE_ZONE_STYLE
+        : isSelected
+          ? SELECTED_ZONE_STYLE
+          : ZONE_PALETTE[z.color_idx % ZONE_PALETTE.length];
+      const subText = z.active
+        ? 'REINIGT JETZT'
+        : isSelected
+          ? `✓ GEWÄHLT (${z.area_sqm.toFixed(1)} m²)`
+          : `${z.area_sqm.toFixed(1)} m²${z.power_mode ? ' • ' + z.power_mode : ''}`;
+      const approxW = Math.max(z.name.length * 7.8 + 22, subText.length * 6.2 + 20, 96);
       const boxH = 38;
 
       svgHtml += `
-        <g transform="translate(${cx}, ${cy})">
+        <g transform="translate(${cx}, ${cy})" style="pointer-events:none;">
           <g class="inv-scale">
-            <rect x="${-approxW / 2}" y="${-boxH / 2}" width="${approxW}" height="${boxH}" rx="7" fill="rgba(15, 23, 42, 0.90)" stroke="${style.stroke}" stroke-width="1.4" />
+            <rect x="${-approxW / 2}" y="${-boxH / 2}" width="${approxW}" height="${boxH}" rx="7" fill="${isSelected ? 'rgba(14, 116, 144, 0.94)' : 'rgba(15, 23, 42, 0.90)'}" stroke="${style.stroke}" stroke-width="${isSelected ? 2 : 1.4}" />
             <text x="0" y="-3" text-anchor="middle" fill="#f8fafc" font-size="12.5" font-weight="700">${this._escapeXml(z.name)}</text>
             <text x="0" y="12" text-anchor="middle" fill="${style.text}" font-size="10.5" font-weight="600">${this._escapeXml(subText)}</text>
           </g>
@@ -587,6 +859,18 @@ class ZoomableMapCard extends HTMLElement {
     });
 
     worldGroup.innerHTML = svgHtml;
+
+    // Bind click listeners on zone polygons
+    worldGroup.querySelectorAll('.zone-poly').forEach(poly => {
+      poly.addEventListener('click', (e) => {
+        const dist = Math.hypot(e.clientX - this._pointerDownX, e.clientY - this._pointerDownY);
+        if (dist > 6) return; // Ignore drags
+        const zName = poly.getAttribute('data-zone-name');
+        if (zName) {
+          this._toggleZoneSelection(zName);
+        }
+      });
+    });
   }
 
   _escapeXml(str) {
@@ -616,31 +900,23 @@ class ZoomableMapCard extends HTMLElement {
     this._basePxPerMeter = Math.min((vw - 2 * pad) / spanX, (vh - 2 * pad) / spanY);
     const totalPxPerMeter = this._basePxPerMeter * this._scale;
 
-    // Transform world meter coords -> viewport screen pixels
     const tx = vw / 2 + this._panX - midX * totalPxPerMeter;
     const ty = vh / 2 + this._panY - midY * totalPxPerMeter;
 
     worldGroup.setAttribute('transform', `translate(${tx}, ${ty}) scale(${totalPxPerMeter})`);
 
-    // Keep text labels at crisp readable screen pixel size regardless of zoom!
     const invScaleFactor = 1.0 / totalPxPerMeter;
     const labelScale = Math.min(1.15, Math.max(0.85, Math.pow(this._scale, 0.25)));
     const finalLabelScale = invScaleFactor * labelScale;
-    const invEls = worldGroup.querySelectorAll('.inv-scale');
-    invEls.forEach(el => {
-      const baseTransform = el.getAttribute('data-base') || '';
+    worldGroup.querySelectorAll('.inv-scale').forEach(el => {
       if (!el.hasAttribute('data-base')) {
-        const cur = el.getAttribute('transform') || '';
-        el.setAttribute('data-base', cur);
+        el.setAttribute('data-base', el.getAttribute('transform') || '');
       }
-      const bT = el.getAttribute('data-base');
-      el.setAttribute('transform', `${bT} scale(${finalLabelScale})`);
+      el.setAttribute('transform', `${el.getAttribute('data-base')} scale(${finalLabelScale})`);
     });
 
-    // Update dynamic Scale Bar
     this._updateScaleBar(totalPxPerMeter);
 
-    // Update Zoom Badge
     const badge = this.shadowRoot.getElementById('zoomBadge');
     if (badge) {
       badge.textContent = `${Math.round(this._scale * 100)}%`;
@@ -652,7 +928,6 @@ class ZoomableMapCard extends HTMLElement {
     const scaleText = this.shadowRoot ? this.shadowRoot.getElementById('scaleText') : null;
     if (!scaleLine || !scaleText || !pxPerMeter) return;
 
-    // Pick a clean meter step (5m, 2m, 1m, 0.5m, 0.2m) that fits nicely in 45..130 px
     const candidates = [5.0, 2.0, 1.0, 0.5, 0.2];
     let chosenM = 2.0;
     for (const m of candidates) {
@@ -668,8 +943,10 @@ class ZoomableMapCard extends HTMLElement {
   }
 
   _onMouseDown(e) {
-    if (e.target.closest('.controls-overlay')) return;
+    if (e.target.closest('.controls-overlay') || e.target.closest('.selection-bar')) return;
     this._isDragging = true;
+    this._pointerDownX = e.clientX;
+    this._pointerDownY = e.clientY;
     this._dragStartX = e.clientX - this._panX;
     this._dragStartY = e.clientY - this._panY;
     const viewport = this.shadowRoot.getElementById('viewport');
@@ -715,10 +992,12 @@ class ZoomableMapCard extends HTMLElement {
   }
 
   _onTouchStart(e) {
-    if (e.target.closest('.controls-overlay')) return;
+    if (e.target.closest('.controls-overlay') || e.target.closest('.selection-bar')) return;
 
     if (e.touches.length === 1) {
       this._isDragging = true;
+      this._pointerDownX = e.touches[0].clientX;
+      this._pointerDownY = e.touches[0].clientY;
       this._dragStartX = e.touches[0].clientX - this._panX;
       this._dragStartY = e.touches[0].clientY - this._panY;
     } else if (e.touches.length === 2) {
@@ -736,7 +1015,7 @@ class ZoomableMapCard extends HTMLElement {
   }
 
   _onTouchMove(e) {
-    if (e.target.closest('.controls-overlay')) return;
+    if (e.target.closest('.controls-overlay') || e.target.closest('.selection-bar')) return;
     e.preventDefault();
 
     if (e.touches.length === 1 && this._isDragging) {
@@ -774,7 +1053,7 @@ class ZoomableMapCard extends HTMLElement {
   }
 
   _onDblClick(e) {
-    if (e.target.closest('.controls-overlay')) return;
+    if (e.target.closest('.controls-overlay') || e.target.closest('.selection-bar') || e.target.closest('.zone-poly')) return;
     if (this._scale > 1.2) {
       this._resetZoom();
     } else {
@@ -856,7 +1135,7 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'zoomable-map-card',
   name: 'Zoomable 3D-Vision Vector Map Card',
-  description: 'Razor-sharp SVG Vector Map with fixed header/legend and Pan & Zoom',
+  description: 'Razor-sharp SVG Vector Map with Click-to-Clean, Avoid Zones, Live Marker and Pan/Zoom',
 });
 
 if (!customElements.get('zoomable-map-card')) {
@@ -864,7 +1143,7 @@ if (!customElements.get('zoomable-map-card')) {
 }
 
 console.info(
-  '%c ZOOMABLE-MAP-CARD %c v2.0.0 Vector SVG Loaded ',
+  '%c ZOOMABLE-MAP-CARD %c v2.1.0 Interactive Vector SVG Loaded ',
   'color: white; background: #0284c7; font-weight: 700;',
   'color: #0284c7; background: #e0f2fe; font-weight: 700;'
 );

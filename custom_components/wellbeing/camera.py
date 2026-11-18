@@ -903,9 +903,34 @@ def get_vector_map_data(api: Any, app: Any, pnc_id: str) -> dict[str, Any] | Non
             charger_pt = (round(first[0], 3), round(first[1], 3))
 
     runs_out: list[list[list[float]]] = []
+    last_pos: list[float] | None = None
     for _, chunk in crumb_chunks:
         for run in _split_runs(chunk):
-            runs_out.append([[round(p[0], 3), round(p[1], 3)] for p in run])
+            pts = [[round(p[0], 3), round(p[1], 3)] for p in run]
+            runs_out.append(pts)
+            if pts:
+                last_pos = pts[-1]
+
+    avoid_zones_raw = [
+        z
+        for z in zones
+        if z.get("type") == "avoid" and z.get("vertices") and len(z["vertices"]) >= 3
+    ]
+    avoid_zones_out: list[dict[str, Any]] = []
+    for idx, z in enumerate(avoid_zones_raw):
+        poly_svg = []
+        for v in z["vertices"]:
+            rx, ry = _rotate_pt(float(v["x"]), float(v["y"]), rot)
+            svg_pt = (rx, -ry)
+            all_pts.append(svg_pt)
+            poly_svg.append([round(rx, 3), round(-ry, 3)])
+        avoid_zones_out.append(
+            {
+                "id": z.get("id"),
+                "name": z.get("name") or f"Sperrzone {idx + 1}",
+                "vertices": poly_svg,
+            }
+        )
 
     zones_out: list[dict[str, Any]] = []
     total_sqm = 0.0
@@ -953,7 +978,9 @@ def get_vector_map_data(api: Any, app: Any, pnc_id: str) -> dict[str, Any] | Non
         "robot_width": ROBOT_WIDTH_M,
         "runs": runs_out,
         "zones": zones_out,
+        "avoid_zones": avoid_zones_out,
         "charger": list(charger_pt) if charger_pt else None,
+        "last_pos": last_pos,
         "telemetry": {
             "name": app.display_name.strip(),
             "model": f"AEG {(app.model_name or 'RX9').upper()}",

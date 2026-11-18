@@ -158,7 +158,9 @@ class WellbeingVacuum(WellbeingEntity, StateVacuumEntity):
             **base,
             "status_code": raw_status,
             "status_detail": ROBOT_STATUS_LABELS_DE.get(raw_status, str(raw_status)),
-            "dustbin_status": DUSTBIN_LABELS_DE.get(dustbin_raw.casefold(), dustbin_raw),
+            "dustbin_status": DUSTBIN_LABELS_DE.get(
+                dustbin_raw.casefold(), dustbin_raw
+            ),
             "active_map": selected_map.get("name") if selected_map else None,
             "active_map_id": selected_map.get("id") if selected_map else None,
             "available_maps": [m["name"] for m in all_maps],

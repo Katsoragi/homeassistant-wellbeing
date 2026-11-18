@@ -10,11 +10,11 @@ import math
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
 from homeassistant.components.camera import Camera
 from homeassistant.const import Platform
 from homeassistant.util import slugify
 from homeassistant.util.percentage import ranged_value_to_percentage
+from PIL import Image, ImageDraw, ImageFont
 
 from .api import Model
 from .const import DEFAULT_NAME, DOMAIN
@@ -24,12 +24,12 @@ from .vacuum import DUSTBIN_LABELS_DE, ROBOT_STATUS_LABELS_DE
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 ZONE_PALETTE = [
-    ((56, 189, 248, 70), (56, 189, 248, 235)),    # Sky Cyan
-    ((168, 85, 247, 70), (192, 132, 252, 235)),   # Purple
-    ((245, 158, 11, 70), (251, 191, 36, 235)),    # Amber
-    ((16, 185, 129, 70), (52, 211, 153, 235)),    # Emerald
-    ((236, 72, 153, 70), (244, 114, 182, 235)),   # Pink
-    ((99, 102, 241, 70), (129, 140, 248, 235)),   # Indigo
+    ((56, 189, 248, 70), (56, 189, 248, 235)),  # Sky Cyan
+    ((168, 85, 247, 70), (192, 132, 252, 235)),  # Purple
+    ((245, 158, 11, 70), (251, 191, 36, 235)),  # Amber
+    ((16, 185, 129, 70), (52, 211, 153, 235)),  # Emerald
+    ((236, 72, 153, 70), (244, 114, 182, 235)),  # Pink
+    ((99, 102, 241, 70), (129, 140, 248, 235)),  # Indigo
 ]
 
 ACTIVE_ZONE_COLOR = ((34, 197, 94, 130), (74, 222, 128, 255))
@@ -53,7 +53,16 @@ def _fetch_missing_raw_map(pnc_id: str, map_id: str) -> dict[str, Any] | None:
     if map_id in _FAILED_MAP_IDS or not AEG_CRED_PATH.exists():
         return None
     try:
-        import base64, gzip, hashlib, hmac, random, time, urllib.parse, requests
+        import base64
+        import gzip
+        import hashlib
+        import hmac
+        import random
+        import time
+        import urllib.parse
+
+        import requests
+
         creds = json.loads(AEG_CRED_PATH.read_text())
         email, password = creds["email"], creds["password"]
         country = creds.get("country", "DE")
@@ -68,57 +77,144 @@ def _fetch_missing_raw_map(pnc_id: str, map_id: str) -> dict[str, Any] | None:
 
         cc_tok = requests.post(
             f"{base}/one-account-authorization/api/v1/token",
-            json={"clientId": cid, "clientSecret": csec, "grantType": "client_credentials", "scope": ""},
+            json={
+                "clientId": cid,
+                "clientSecret": csec,
+                "grantType": "client_credentials",
+                "scope": "",
+            },
             headers={"x-api-key": xkey, "User-Agent": ua, "Authorization": "Bearer"},
             timeout=10,
         ).json()["accessToken"]
 
         idp = requests.get(
             f"{base}/one-account-user/api/v1/identity-providers?brand=aeg&countryCode={country}",
-            headers={"Authorization": f"Bearer {cc_tok}", "x-api-key": xkey, "User-Agent": ua, "Context-Brand": "aeg"},
+            headers={
+                "Authorization": f"Bearer {cc_tok}",
+                "x-api-key": xkey,
+                "User-Agent": ua,
+                "Context-Brand": "aeg",
+            },
             timeout=10,
         ).json()[0]
-        reg_base, g_key, g_dom = idp["httpRegionalBaseUrl"], idp["apiKey"], idp["domain"]
+        reg_base, g_key, g_dom = (
+            idp["httpRegionalBaseUrl"],
+            idp["apiKey"],
+            idp["domain"],
+        )
 
-        nonce = lambda: f"{round(time.time() * 1000)}_-" + str(random.randint(100000000, 999999999))
+        def nonce() -> str:
+            return f"{round(time.time() * 1000)}_-" + str(
+                random.randint(100000000, 999999999)
+            )
+
         gua = "okhttp/4.10.0"
         r1 = requests.post(
             f"https://socialize.{g_dom}/socialize.getIDs",
-            headers={"apikey": g_key, "user-agent": gua, "content-type": "application/x-www-form-urlencoded"},
-            data={"apiKey": g_key, "format": "json", "httpStatusCodes": "false", "nonce": nonce(), "sdk": "Android_7.0.11", "targetEnv": "mobile"},
+            headers={
+                "apikey": g_key,
+                "user-agent": gua,
+                "content-type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "apiKey": g_key,
+                "format": "json",
+                "httpStatusCodes": "false",
+                "nonce": nonce(),
+                "sdk": "Android_7.0.11",
+                "targetEnv": "mobile",
+            },
             timeout=10,
         ).json()
         r2 = requests.post(
             f"https://accounts.{g_dom}/accounts.login",
-            headers={"apikey": g_key, "user-agent": gua, "content-type": "application/x-www-form-urlencoded"},
-            data={"apiKey": g_key, "format": "json", "httpStatusCodes": "false", "nonce": nonce(), "sdk": "Android_7.0.11", "targetEnv": "mobile", "gmid": r1["gmid"], "ucid": r1["ucid"], "loginID": email, "password": password},
+            headers={
+                "apikey": g_key,
+                "user-agent": gua,
+                "content-type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "apiKey": g_key,
+                "format": "json",
+                "httpStatusCodes": "false",
+                "nonce": nonce(),
+                "sdk": "Android_7.0.11",
+                "targetEnv": "mobile",
+                "gmid": r1["gmid"],
+                "ucid": r1["ucid"],
+                "loginID": email,
+                "password": password,
+            },
             timeout=10,
         ).json()
         params = {
-            "apiKey": g_key, "fields": "country", "format": "json", "gmid": r1["gmid"], "httpStatusCodes": "false",
-            "nonce": nonce(), "oauth_token": r2["sessionInfo"]["sessionToken"], "sdk": "Android_7.0.11",
-            "targetEnv": "mobile", "timestamp": r2["signatureTimestamp"], "ucid": r1["ucid"],
+            "apiKey": g_key,
+            "fields": "country",
+            "format": "json",
+            "gmid": r1["gmid"],
+            "httpStatusCodes": "false",
+            "nonce": nonce(),
+            "oauth_token": r2["sessionInfo"]["sessionToken"],
+            "sdk": "Android_7.0.11",
+            "targetEnv": "mobile",
+            "timestamp": r2["signatureTimestamp"],
+            "ucid": r1["ucid"],
         }
         jurl = f"https://accounts.{g_dom}/accounts.getJWT"
         pq = urllib.parse.quote(urllib.parse.urlencode(params))
         skey = base64.b64decode(r2["sessionInfo"]["sessionSecret"].encode("ascii"))
         base_sig = f"POST&{urllib.parse.quote(jurl, safe='')}&{pq}"
-        params["sig"] = base64.urlsafe_b64encode(hmac.new(skey, base_sig.encode("utf-8"), hashlib.sha1).digest()).decode("ascii")
-        r3 = requests.post(jurl, headers={"apikey": g_key, "user-agent": gua, "content-type": "application/x-www-form-urlencoded"}, data=params, timeout=10).json()
-        r4 = requests.post(
-            f"{base}/one-account-authorization/api/v1/token",
-            json={"clientId": cid, "idToken": r3["id_token"], "grantType": "urn:ietf:params:oauth:grant-type:token-exchange"},
-            headers={"Origin-Country-Code": r2["profile"]["country"], "User-Agent": ua, "x-api-key": xkey},
+        params["sig"] = base64.urlsafe_b64encode(
+            hmac.new(skey, base_sig.encode("utf-8"), hashlib.sha1).digest()
+        ).decode("ascii")
+        r3 = requests.post(
+            jurl,
+            headers={
+                "apikey": g_key,
+                "user-agent": gua,
+                "content-type": "application/x-www-form-urlencoded",
+            },
+            data=params,
             timeout=10,
         ).json()
-        hdrs = {"Authorization": f"Bearer {r4['accessToken']}", "x-api-key": xkey, "User-Agent": ua, "Context-Brand": "aeg"}
-        maps = requests.get(f"{reg_base}/purei/api/v2/appliances/{pnc_id}/interactive-maps", headers=hdrs, timeout=10).json()
+        r4 = requests.post(
+            f"{base}/one-account-authorization/api/v1/token",
+            json={
+                "clientId": cid,
+                "idToken": r3["id_token"],
+                "grantType": "urn:ietf:params:oauth:grant-type:token-exchange",
+            },
+            headers={
+                "Origin-Country-Code": r2["profile"]["country"],
+                "User-Agent": ua,
+                "x-api-key": xkey,
+            },
+            timeout=10,
+        ).json()
+        hdrs = {
+            "Authorization": f"Bearer {r4['accessToken']}",
+            "x-api-key": xkey,
+            "User-Agent": ua,
+            "Context-Brand": "aeg",
+        }
+        maps = requests.get(
+            f"{reg_base}/purei/api/v2/appliances/{pnc_id}/interactive-maps",
+            headers=hdrs,
+            timeout=10,
+        ).json()
         for m in maps:
             mid = m["id"]
             seq = m.get("sequenceNumber", 0)
-            rm = requests.get(f"{reg_base}/purei/api/v2/appliances/{pnc_id}/interactive-maps/{mid}/sequences/{seq}/maps", headers=hdrs, params={"mapFormat": "rawgzip"}, timeout=15)
+            rm = requests.get(
+                f"{reg_base}/purei/api/v2/appliances/{pnc_id}/interactive-maps/{mid}/sequences/{seq}/maps",
+                headers=hdrs,
+                params={"mapFormat": "rawgzip"},
+                timeout=15,
+            )
             if rm.status_code == 200:
-                _RAW_MAPS_CACHE.setdefault(pnc_id, {}).setdefault("maps", {})[mid] = json.loads(gzip.decompress(rm.content).decode("utf-8"))
+                _RAW_MAPS_CACHE.setdefault(pnc_id, {}).setdefault("maps", {})[mid] = (
+                    json.loads(gzip.decompress(rm.content).decode("utf-8"))
+                )
         RAW_MAPS_PATH.write_text(json.dumps(_RAW_MAPS_CACHE))
         return _RAW_MAPS_CACHE.get(pnc_id, {}).get("maps", {}).get(map_id)
     except Exception as err:
@@ -144,9 +240,13 @@ def _get_raw_map(pnc_id: str, map_id: str | None) -> dict[str, Any] | None:
 
 def _load_font(size: int, bold: bool = False):
     pattern = "DejaVu-Sans-Bold.ttf" if bold else "DejaVu-Sans.ttf"
-    matches = glob.glob(f"/usr/local/lib/python*/site-packages/aioslimproto/font/{pattern}")
+    matches = glob.glob(
+        f"/usr/local/lib/python*/site-packages/aioslimproto/font/{pattern}"
+    )
     if not matches and not bold:
-        matches = glob.glob("/usr/local/lib/python*/site-packages/env_canada/DejaVuSans.ttf")
+        matches = glob.glob(
+            "/usr/local/lib/python*/site-packages/env_canada/DejaVuSans.ttf"
+        )
     if matches:
         try:
             return ImageFont.truetype(matches[0], size=size)
@@ -160,7 +260,9 @@ def _rotate_pt(x: float, y: float, rad: float) -> tuple[float, float]:
     return (x * c - y * s, x * s + y * c)
 
 
-def _to_global(pt: list[float] | tuple[float, float], transform: list[float]) -> tuple[float, float]:
+def _to_global(
+    pt: list[float] | tuple[float, float], transform: list[float]
+) -> tuple[float, float]:
     tx, ty, a = transform
     return _rotate_pt(pt[0] - tx, pt[1] - ty, -a)
 
@@ -249,14 +351,18 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
     def extra_state_attributes(self) -> dict[str, Any]:
         selected_map = self.api.get_selected_map(self.pnc_id)
         all_maps = self.api.get_interactive_maps(self.pnc_id)
-        raw_map = _get_raw_map(self.pnc_id, selected_map.get("id") if selected_map else None)
+        raw_map = _get_raw_map(
+            self.pnc_id, selected_map.get("id") if selected_map else None
+        )
         zones = []
         if selected_map:
             zones = [
                 {
                     "name": z["name"],
                     "id": z["id"],
-                    "power_mode": POWER_MODE_LABELS.get(z.get("power_mode"), str(z.get("power_mode"))),
+                    "power_mode": POWER_MODE_LABELS.get(
+                        z.get("power_mode"), str(z.get("power_mode"))
+                    ),
                     "area_sqm": round(_polygon_area_sqm(z.get("vertices") or []), 1),
                 }
                 for z in selected_map.get("zones", [])
@@ -304,12 +410,16 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
         dustbin_text = DUSTBIN_LABELS_DE.get(dustbin_raw.casefold(), dustbin_raw)
 
         bat_raw = reported.get("batteryStatus", 6)
-        bat_pct = max(0, min(100, round(ranged_value_to_percentage(app.battery_range, bat_raw))))
+        bat_pct = max(
+            0, min(100, round(ranged_value_to_percentage(app.battery_range, bat_raw)))
+        )
         fan_speed = (app.vacuum_fan_speed or "smart").upper()
 
         selected_map = self.api.get_selected_map(self.pnc_id)
         all_maps = self.api.get_interactive_maps(self.pnc_id)
-        raw_map = _get_raw_map(self.pnc_id, selected_map.get("id") if selected_map else None)
+        raw_map = _get_raw_map(
+            self.pnc_id, selected_map.get("id") if selected_map else None
+        )
         active_cleaning = set(self.api.get_active_cleaning_zones(self.pnc_id))
         is_cleaning = raw_status in (1, 3)
 
@@ -320,7 +430,9 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
 
         # Subtle background grid
         for gx in range(0, w, 40):
-            draw.line([(gx, canvas_top), (gx, canvas_bottom)], fill=(26, 36, 54, 255), width=1)
+            draw.line(
+                [(gx, canvas_top), (gx, canvas_bottom)], fill=(26, 36, 54, 255), width=1
+            )
         for gy in range(canvas_top, canvas_bottom, 40):
             draw.line([(0, gy), (w, gy)], fill=(26, 36, 54, 255), width=1)
 
@@ -328,10 +440,16 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
         draw.rectangle([(0, 0), (w, header_h)], fill=(20, 29, 47, 255))
         draw.line([(0, header_h), (w, header_h)], fill=(51, 65, 85, 255), width=2)
 
-        robot_title = f"{app.display_name.strip()}  •  AEG {(app.model_name or 'RX9').upper()}"
+        robot_title = (
+            f"{app.display_name.strip()}  •  AEG {(app.model_name or 'RX9').upper()}"
+        )
         map_name = selected_map["name"] if selected_map else "Keine Karte"
         crumb_cnt = len(raw_map.get("crumbs", [])) if raw_map else 0
-        scan_badge = f"3D-Vision Scan ({crumb_cnt} Messpunkte)" if crumb_cnt else f"{len(all_maps)} Karten in Cloud"
+        scan_badge = (
+            f"3D-Vision Scan ({crumb_cnt} Messpunkte)"
+            if crumb_cnt
+            else f"{len(all_maps)} Karten in Cloud"
+        )
 
         draw.text((22, 15), robot_title, fill=(248, 250, 252, 255), font=font_title)
         draw.text(
@@ -366,10 +484,17 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
         db_color = (74, 222, 128, 255) if dustbin_ok else (248, 113, 113, 255)
         db_label = f"Staubbehälter: {dustbin_text}"
         db_bbox = draw.textbbox((0, 0), db_label, font=font_small)
-        draw.text((w - (db_bbox[2] - db_bbox[0]) - 22, 52), db_label, fill=db_color, font=font_small)
+        draw.text(
+            (w - (db_bbox[2] - db_bbox[0]) - 22, 52),
+            db_label,
+            fill=db_color,
+            font=font_small,
+        )
 
         zones = (selected_map or {}).get("zones") or []
-        clean_zones = [z for z in zones if z.get("vertices") and len(z["vertices"]) >= 3]
+        clean_zones = [
+            z for z in zones if z.get("vertices") and len(z["vertices"]) >= 3
+        ]
         rot = float((selected_map or {}).get("rotation") or 0.0) - (math.pi / 2.0)
 
         # Gather all rotated world coordinates from both 3D-Vision scan crumbs & interactive zones
@@ -445,20 +570,36 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
                     for run in _split_runs(chunk):
                         pts = [_rot_to_px(p[0], p[1]) for p in run]
                         if len(pts) > 1:
-                            sdraw.line(pts, fill=(148, 163, 184, 240), width=wall_px, joint="curve")
+                            sdraw.line(
+                                pts,
+                                fill=(148, 163, 184, 240),
+                                width=wall_px,
+                                joint="curve",
+                            )
                         for p in (pts[0], pts[-1]):
                             r = wall_px / 2.0
-                            sdraw.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=(148, 163, 184, 240))
+                            sdraw.ellipse(
+                                [p[0] - r, p[1] - r, p[0] + r, p[1] + r],
+                                fill=(148, 163, 184, 240),
+                            )
 
                 # 1B: Scanned Room Floor Interior Swath
                 for _, chunk in crumb_chunks:
                     for run in _split_runs(chunk):
                         pts = [_rot_to_px(p[0], p[1]) for p in run]
                         if len(pts) > 1:
-                            sdraw.line(pts, fill=(43, 76, 126, 255), width=swath_px, joint="curve")
+                            sdraw.line(
+                                pts,
+                                fill=(43, 76, 126, 255),
+                                width=swath_px,
+                                joint="curve",
+                            )
                         for p in (pts[0], pts[-1]):
                             r = swath_px / 2.0
-                            sdraw.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=(43, 76, 126, 255))
+                            sdraw.ellipse(
+                                [p[0] - r, p[1] - r, p[0] + r, p[1] + r],
+                                fill=(43, 76, 126, 255),
+                            )
 
                 # 1C: Driven Cleaning Trajectory Path
                 path_w = max(2, int(scale / 26))
@@ -466,7 +607,12 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
                     for run in _split_runs(chunk):
                         pts = [_rot_to_px(p[0], p[1]) for p in run]
                         if len(pts) > 1:
-                            sdraw.line(pts, fill=(125, 211, 252, 150), width=path_w, joint="curve")
+                            sdraw.line(
+                                pts,
+                                fill=(125, 211, 252, 150),
+                                width=path_w,
+                                joint="curve",
+                            )
 
                 img = Image.alpha_composite(img, scan_layer)
                 draw = ImageDraw.Draw(img)
@@ -481,7 +627,9 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
                 verts = z["vertices"]
                 poly_px = [_world_to_px(float(v["x"]), float(v["y"])) for v in verts]
                 z_name = z.get("name", f"Zone {idx + 1}")
-                is_zone_active = (z_name in active_cleaning) or (is_cleaning and not active_cleaning)
+                is_zone_active = (z_name in active_cleaning) or (
+                    is_cleaning and not active_cleaning
+                )
 
                 fill_col, border_col = (
                     ACTIVE_ZONE_COLOR
@@ -532,7 +680,10 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
                 csx, csy = _rot_to_px(charger_pt[0], charger_pt[1])
                 dock_r = max(11, int(0.18 * scale))
                 draw.ellipse(
-                    [(csx - dock_r - 4, csy - dock_r - 4), (csx + dock_r + 4, csy + dock_r + 4)],
+                    [
+                        (csx - dock_r - 4, csy - dock_r - 4),
+                        (csx + dock_r + 4, csy + dock_r + 4),
+                    ],
                     fill=(16, 185, 129, 90),
                     outline=(52, 211, 153, 230),
                     width=2,
@@ -543,21 +694,37 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
                     outline=(240, 253, 244, 255),
                     width=2,
                 )
-                draw.line([(csx, csy - dock_r * 0.5), (csx, csy + dock_r * 0.5)], fill=(15, 23, 42, 255), width=3)
-                draw.line([(csx - dock_r * 0.45, csy), (csx + dock_r * 0.45, csy)], fill=(15, 23, 42, 255), width=3)
+                draw.line(
+                    [(csx, csy - dock_r * 0.5), (csx, csy + dock_r * 0.5)],
+                    fill=(15, 23, 42, 255),
+                    width=3,
+                )
+                draw.line(
+                    [(csx - dock_r * 0.45, csy), (csx + dock_r * 0.45, csy)],
+                    fill=(15, 23, 42, 255),
+                    width=3,
+                )
 
                 dl_txt = "Ladestation"
                 dl_bb = draw.textbbox((0, 0), dl_txt, font=font_zone_sub)
                 dl_w = dl_bb[2] - dl_bb[0] + 12
                 dl_h = dl_bb[3] - dl_bb[1] + 6
                 draw.rounded_rectangle(
-                    [(csx - dl_w / 2, csy + dock_r + 5), (csx + dl_w / 2, csy + dock_r + 5 + dl_h)],
+                    [
+                        (csx - dl_w / 2, csy + dock_r + 5),
+                        (csx + dl_w / 2, csy + dock_r + 5 + dl_h),
+                    ],
                     radius=5,
                     fill=(6, 78, 59, 235),
                     outline=(52, 211, 153, 210),
                     width=1,
                 )
-                draw.text((csx - dl_w / 2 + 6, csy + dock_r + 7), dl_txt, fill=(209, 250, 229, 255), font=font_zone_sub)
+                draw.text(
+                    (csx - dl_w / 2 + 6, csy + dock_r + 7),
+                    dl_txt,
+                    fill=(209, 250, 229, 255),
+                    font=font_zone_sub,
+                )
 
             # Push room label boxes away from the Charger Dock so both remain 100% readable
             if charger_pt is not None:
@@ -568,7 +735,9 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
                     min_dx = item["w"] / 2 + 48
                     min_dy = item["h"] / 2 + 30
                     if abs(dx) < min_dx and abs(dy) < min_dy:
-                        item["cy"] = (csy - min_dy - 4) if dy < 0 else (csy + min_dy + 14)
+                        item["cy"] = (
+                            (csy - min_dy - 4) if dy < 0 else (csy + min_dy + 14)
+                        )
 
             # De-overlap adjacent label boxes (e.g. Badezimmer & Schlafzimmer)
             for i in range(len(label_items)):
@@ -614,9 +783,17 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
             bar_m = 2.0
             bar_px = bar_m * scale
             bx0, by0 = 26, canvas_bottom - 22
-            draw.line([(bx0, by0), (bx0 + bar_px, by0)], fill=(148, 163, 184, 255), width=3)
-            draw.line([(bx0, by0 - 5), (bx0, by0 + 5)], fill=(148, 163, 184, 255), width=2)
-            draw.line([(bx0 + bar_px, by0 - 5), (bx0 + bar_px, by0 + 5)], fill=(148, 163, 184, 255), width=2)
+            draw.line(
+                [(bx0, by0), (bx0 + bar_px, by0)], fill=(148, 163, 184, 255), width=3
+            )
+            draw.line(
+                [(bx0, by0 - 5), (bx0, by0 + 5)], fill=(148, 163, 184, 255), width=2
+            )
+            draw.line(
+                [(bx0 + bar_px, by0 - 5), (bx0 + bar_px, by0 + 5)],
+                fill=(148, 163, 184, 255),
+                width=2,
+            )
             if total_sqm > 0:
                 scale_info = f"2.0 m   |   Zonenfläche: {total_sqm:.1f} m²   |   3D-Vision Scan ({crumb_cnt} Punkte)"
             else:
@@ -631,12 +808,19 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
 
         # Footer Bar
         draw.rectangle([(0, canvas_bottom), (w, h)], fill=(20, 29, 47, 255))
-        draw.line([(0, canvas_bottom), (w, canvas_bottom)], fill=(51, 65, 85, 255), width=1)
+        draw.line(
+            [(0, canvas_bottom), (w, canvas_bottom)], fill=(51, 65, 85, 255), width=1
+        )
         all_map_names = "  •  ".join(
             f"[{m['name']}]" if m["name"] == map_name else m["name"] for m in all_maps
         )
         footer_left = f"Verfügbare Karten: {all_map_names or 'Keine'}"
-        draw.text((22, canvas_bottom + 14), footer_left, fill=(148, 163, 184, 255), font=font_small)
+        draw.text(
+            (22, canvas_bottom + 14),
+            footer_left,
+            fill=(148, 163, 184, 255),
+            font=font_small,
+        )
 
         zone_names = [z["name"] for z in clean_zones]
         footer_right = (

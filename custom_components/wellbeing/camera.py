@@ -369,6 +369,7 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
                 if z.get("type") == "clean"
             ]
         return {
+            "pnc_id": self.pnc_id,
             "active_map": selected_map.get("name") if selected_map else None,
             "active_map_id": selected_map.get("id") if selected_map else None,
             "available_maps": [m["name"] for m in all_maps],
@@ -839,3 +840,139 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format="PNG", optimize=True)
         return buf.getvalue()
+
+
+def get_vector_map_data(api: Any, pnc_id: str) -> dict[str, Any] | None:
+    """Return vector map geometry (in rotated meter coordinates) and live telemetry."""
+    if not api or not getattr(api, "data", None):
+        return None
+    app = api.data.get_appliance(pnc_id)
+    if not app:
+        return None
+
+    reported = app.reported_state or {}
+    raw_status = reported.get("robotStatus", 10)
+    status_text = ROBOT_STATUS_LABELS_DE.get(raw_status, f"Status {raw_status}")
+    dustbin_raw = str(reported.get("dustbinStatus", "connected"))
+    dustbin_ok = dustbin_raw.casefold() in ("connected", "empty", "notconnected")
+    dustbin_text = DUSTBIN_LABELS_DE.get(dustbin_raw.casefold(), dustbin_raw)
+
+    bat_raw = reported.get("batteryStatus", 6)
+    bat_pct = max(
+        0, min(100, round(ranged_value_to_percentage(app.battery_range, bat_raw)))
+    )
+    fan_speed = (app.vacuum_fan_speed or "smart").upper()
+
+    selected_map = api.get_selected_map(pnc_id)
+    all_maps = api.get_interactive_maps(pnc_id)
+    raw_map = _get_raw_map(pnc_id, selected_map.get("id") if selected_map else None)
+    active_cleaning = set(api.get_active_cleaning_zones(pnc_id))
+    is_cleaning = raw_status in (1, 3)
+
+    zones = (selected_map or {}).get("zones") or []
+    clean_zones = [z for z in zones if z.get("vertices") and len(z["vertices"]) >= 3]
+    rot = float((selected_map or {}).get("rotation") or 0.0) - (math.pi / 2.0)
+
+    all_pts: list[tuple[float, float]] = []
+    crumb_chunks: list[tuple[int, list[tuple[float, float]]]] = []
+    charger_pt: tuple[float, float] | None = None
+
+    if raw_map and raw_map.get("crumbs"):
+        transforms = {
+            t["t"]: t["xya"]
+            for t in raw_map.get("transforms", [])
+            if len(t.get("xya", [])) == 3
+        }
+        identity = [0.0, 0.0, 0.0]
+        for c in raw_map["crumbs"]:
+            if "xy" not in c:
+                continue
+            g_pt = _to_global(c["xy"], transforms.get(c.get("t"), identity))
+            rx, ry = _rotate_pt(g_pt[0], g_pt[1], rot)
+            svg_pt = (rx, -ry)
+            all_pts.append(svg_pt)
+            if crumb_chunks and crumb_chunks[-1][0] == c.get("t"):
+                crumb_chunks[-1][1].append(svg_pt)
+            else:
+                crumb_chunks.append((c.get("t"), [svg_pt]))
+
+        if 1000 in transforms:
+            cg = _to_global((0.0, 0.0), transforms[1000])
+            crx, cry = _rotate_pt(cg[0], cg[1], rot)
+            charger_pt = (round(crx, 3), round(-cry, 3))
+            all_pts.append(charger_pt)
+        elif crumb_chunks and crumb_chunks[0][1]:
+            first = crumb_chunks[0][1][0]
+            charger_pt = (round(first[0], 3), round(first[1], 3))
+
+    runs_out: list[list[list[float]]] = []
+    for _, chunk in crumb_chunks:
+        for run in _split_runs(chunk):
+            runs_out.append([[round(p[0], 3), round(p[1], 3)] for p in run])
+
+    zones_out: list[dict[str, Any]] = []
+    total_sqm = 0.0
+    for idx, z in enumerate(clean_zones):
+        poly_svg = []
+        for v in z["vertices"]:
+            rx, ry = _rotate_pt(float(v["x"]), float(v["y"]), rot)
+            svg_pt = (rx, -ry)
+            all_pts.append(svg_pt)
+            poly_svg.append([round(rx, 3), round(-ry, 3)])
+
+        cx = sum(p[0] for p in poly_svg) / len(poly_svg)
+        cy = sum(p[1] for p in poly_svg) / len(poly_svg)
+        area_sqm = round(_polygon_area_sqm(z["vertices"]), 1)
+        total_sqm += area_sqm
+        z_name = z.get("name") or f"Zone {idx + 1}"
+        pm_label = POWER_MODE_LABELS.get(z.get("power_mode"), "")
+        zones_out.append(
+            {
+                "id": z.get("id"),
+                "name": z_name,
+                "power_mode": pm_label,
+                "area_sqm": area_sqm,
+                "vertices": poly_svg,
+                "center": [round(cx, 3), round(cy, 3)],
+                "color_idx": idx % len(ZONE_PALETTE),
+                "active": z_name in active_cleaning,
+            }
+        )
+
+    bounds = None
+    if all_pts:
+        pad = 0.35
+        bounds = {
+            "min_x": round(min(p[0] for p in all_pts) - pad, 3),
+            "max_x": round(max(p[0] for p in all_pts) + pad, 3),
+            "min_y": round(min(p[1] for p in all_pts) - pad, 3),
+            "max_y": round(max(p[1] for p in all_pts) + pad, 3),
+        }
+
+    return {
+        "pnc_id": pnc_id,
+        "map_revision": api.map_revision,
+        "bounds": bounds,
+        "robot_width": ROBOT_WIDTH_M,
+        "runs": runs_out,
+        "zones": zones_out,
+        "charger": list(charger_pt) if charger_pt else None,
+        "telemetry": {
+            "name": app.display_name.strip(),
+            "model": f"AEG {(app.model_name or 'RX9').upper()}",
+            "status_text": status_text,
+            "status_code": raw_status,
+            "is_cleaning": is_cleaning,
+            "is_warning": raw_status in (5, 7, 12),
+            "is_error": raw_status == 11 or not dustbin_ok,
+            "bat_pct": bat_pct,
+            "fan_speed": fan_speed,
+            "dustbin_text": dustbin_text,
+            "dustbin_ok": dustbin_ok,
+            "active_map": selected_map["name"] if selected_map else "Keine Karte",
+            "all_maps": [m["name"] for m in all_maps],
+            "crumb_cnt": len(raw_map.get("crumbs", [])) if raw_map else 0,
+            "total_sqm": round(total_sqm, 1),
+            "active_cleaning_zones": list(active_cleaning),
+        },
+    }

@@ -11,6 +11,7 @@ from datetime import timedelta
 from time import monotonic
 
 from aiohttp import ClientResponseError, ClientSession
+from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_API_KEY, Platform
 from homeassistant.core import HomeAssistant
@@ -93,9 +94,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
+    if (
+        hasattr(hass, "http")
+        and hass.http is not None
+        and not hass.data[DOMAIN].get("_http_view_registered")
+    ):
+        hass.http.register_view(WellbeingMapDataView(hass))
+        hass.data[DOMAIN]["_http_view_registered"] = True
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
+
+
+class WellbeingMapDataView(HomeAssistantView):
+    """Serve vector map geometry and live telemetry for a vacuum PNC."""
+
+    url = "/api/wellbeing/map_data/{pnc_id}"
+    name = "api:wellbeing:map_data"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the view."""
+        self.hass = hass
+
+    async def get(self, request, pnc_id: str):
+        """Return JSON vector map data for the requested PNC."""
+        from .camera import get_vector_map_data
+
+        for coord in list(self.hass.data.get(DOMAIN, {}).values()):
+            api = getattr(coord, "api", None)
+            if api is None:
+                continue
+            data = await self.hass.async_add_executor_job(
+                get_vector_map_data, api, pnc_id
+            )
+            if data is not None:
+                return self.json(data)
+
+        return self.json_message("Map data not found", status_code=404)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

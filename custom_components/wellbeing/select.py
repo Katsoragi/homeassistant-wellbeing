@@ -89,7 +89,7 @@ class WellbeingMapSelect(WellbeingEntity, SelectEntity):
             config_entry,
             pnc_id,
             Platform.SELECT,
-            "active_map",
+            "activeMap",
         )
         self.entity_id = f"select.{slugify(f'{DEFAULT_NAME}_{self.get_appliance.display_name}_active_map')}"
         self._options: list[str] = []

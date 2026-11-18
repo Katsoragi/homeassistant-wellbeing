@@ -124,10 +124,17 @@ class WellbeingMapDataView(HomeAssistantView):
 
         for coord in list(self.hass.data.get(DOMAIN, {}).values()):
             api = getattr(coord, "api", None)
-            if api is None:
+            coord_data = getattr(coord, "data", None)
+            if api is None or not isinstance(coord_data, dict):
+                continue
+            appliances = coord_data.get("appliances")
+            if appliances is None:
+                continue
+            app = appliances.get_appliance(pnc_id)
+            if app is None:
                 continue
             data = await self.hass.async_add_executor_job(
-                get_vector_map_data, api, pnc_id
+                get_vector_map_data, api, app, pnc_id
             )
             if data is not None:
                 return self.json(data)

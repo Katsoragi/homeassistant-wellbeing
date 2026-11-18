@@ -842,12 +842,9 @@ class WellbeingMapCamera(WellbeingEntity, Camera):
         return buf.getvalue()
 
 
-def get_vector_map_data(api: Any, pnc_id: str) -> dict[str, Any] | None:
+def get_vector_map_data(api: Any, app: Any, pnc_id: str) -> dict[str, Any] | None:
     """Return vector map geometry (in rotated meter coordinates) and live telemetry."""
-    if not api or not getattr(api, "data", None):
-        return None
-    app = api.data.get_appliance(pnc_id)
-    if not app:
+    if not api or not app:
         return None
 
     reported = app.reported_state or {}

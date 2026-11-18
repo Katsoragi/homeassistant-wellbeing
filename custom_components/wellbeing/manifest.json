@@ -18,5 +18,5 @@
   "requirements": [
     "pyelectroluxgroup==0.2.7"
   ],
-  "version": "v1.5.1-3dvision"
+  "version": "v1.5.2-3dvision"
 }
